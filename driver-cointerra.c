@@ -21,9 +21,11 @@
 #define COINTERRA_EP_R  (LIBUSB_ENDPOINT_IN  | 1)
 #define COINTERRA_EP_W  (LIBUSB_ENDPOINT_OUT | 1)
 #define COINTERRA_USB_TIMEOUT  100
+#define COINTERRA_USB_POLL_TIMEOUT  1
 #define COINTERRA_PACKET_SIZE  0x40
 #define COINTERRA_START_SEQ  0x5a,0x5a
 #define COINTERRA_MSG_SIZE  (COINTERRA_PACKET_SIZE - sizeof(cointerra_startseq))
+#define COINTERRA_MSGBODY_SIZE  (COINTERRA_MSG_SIZE - 2)
 
 BFG_REGISTER_DRIVER(cointerra_drv)
 
@@ -48,7 +50,39 @@ enum cointerra_msg_type_in {
 	CMTI_ERRINFO   = 9,
 };
 
+enum cointerra_reset_level {
+	CRL_WORK_UPDATE = 1,
+	CRL_NEW_BLOCK   = 2,
+	CRL_INIT        = 3,
+};
+
+struct cointerra_dev_state {
+	libusb_device_handle *usbh;
+};
+
 static const uint8_t cointerra_startseq[] = {COINTERRA_START_SEQ};
+
+static
+int cointerra_write_msg(libusb_device_handle * const usbh, const char * const repr, const uint16_t msgtype, const void * const msgbody, const unsigned timeout)
+{
+	uint8_t buf[COINTERRA_PACKET_SIZE], *p;
+	memcpy(buf, cointerra_startseq, sizeof(cointerra_startseq));
+	p = &buf[sizeof(cointerra_startseq)];
+	pk_u16le(p, 0, msgtype);
+	memcpy(&p[2], msgbody, COINTERRA_MSGBODY_SIZE);
+	
+	int xfer;
+	uint16_t msgtype;
+	
+	e = libusb_bulk_transfer(usbh, COINTERRA_EP_W, buf, sizeof(buf), &xfer, timeout);
+	if (e)
+		return e;
+	
+	if (xfer != COINTERRA_PACKET_SIZE)
+		return LIBUSB_ERROR_OTHER;
+	
+	return 0;
+}
 
 static
 int cointerra_read_msg(uint16_t * const out_msgtype, uint8_t * const out, libusb_device_handle * const usbh, const char * const repr, const unsigned timeout)
@@ -69,6 +103,22 @@ int cointerra_read_msg(uint16_t * const out_msgtype, uint8_t * const out, libusb
 	memcpy(out, bufp, COINTERRA_MSG_SIZE);
 	*out_msgtype = upk_u16le(out, 0);
 	return 0;
+}
+
+static
+int cointerra_request(libusb_device_handle * const usbh, const uint16_t msgtype, uint16_t interval_cs)
+{
+	uint8_t buf[COINTERRA_MSGBODY_SIZE];
+	pk_u16le(buf, 0, msgtype);
+	pk_u16le(buf, 2, interval_cs);
+	return cointerra_write_msg(usbh, cointerra_drv.dname, CMTO_REQUEST, buf, COINTERRA_USB_TIMEOUT);
+}
+
+static
+int cointerra_reset(libusb_device_handle * const usbh, const enum cointerra_reset_level crl)
+{
+	uint8_t buf[COINTERRA_MSGBODY_SIZE] = { crl };
+	return cointerra_write_msg(usbh, cointerra_drv.dname, CMTO_RESET, buf, COINTERRA_USB_TIMEOUT);
 }
 
 static
@@ -94,23 +144,17 @@ bool cointerra_lowl_probe(const struct lowlevel_device_info * const info)
 	
 	unsigned cores;
 	{
-		uint8_t buf[COINTERRA_PACKET_SIZE] = {
-			COINTERRA_START_SEQ,
-			CMTO_REQUEST,
-			CMTI_INFO, 0,
-		};
-		int xfer;
-		uint16_t msgtype;
-		
-		e = libusb_bulk_transfer(usbh, COINTERRA_EP_W, buf, sizeof(buf), &xfer, COINTERRA_USB_TIMEOUT);
+		e = cointerra_request(usbh, CMTI_INFO, 0);
 		if (e)
-			return e;
+			goto err;
 		
+		uint16_t msgtype;
+		uint8_t buf[COINTERRA_MSG_SIZE];
 		while (true)
 		{
 			e = cointerra_read_msg(&msgtype, buf, usbh, cointerra_drv.dname, COINTERRA_USB_TIMEOUT);
 			if (e)
-				return e;
+				goto err;
 			if (msgtype == CMTI_INFO)
 				break;
 			// FIXME: Timeout if we keep getting packets we don't care about
@@ -135,6 +179,102 @@ bool cointerra_lowl_probe(const struct lowlevel_device_info * const info)
 		.deven = DEV_ENABLED,
 	};
 	return add_cgpu(cgpu);
+
+err:
+	libusb_close(usbh);
+	return false;
+}
+
+static
+bool cointerra_init(struct thr_info * const master_thr)
+{
+	struct cgpu_info * const dev = master_thr->cgpu;
+	struct lowlevel_device_info * const info = dev->device_data;
+	struct cointerra_dev_state * const devstate = malloc(*devstate);
+	int e;
+	
+	*devstate = (struct cointerra_dev_state){
+		.usbh = NULL,
+	};
+	e = libusb_open(info->lowl_data, &devstate->usbh);
+	if (e)
+		applogr(false, LOG_ERR, "%s: Failed to open %s: %s",
+		        dev->dev_repr, info->devid, bfg_strerror(e, BST_LIBUSB));
+	libusb_device_handle * const usbh = devstate->usbh;
+	
+	// Request regular status updates
+	cointerra_request(usbh, CMTI_STATUS, 0x83d);
+	
+	cointerra_reset(usbh, CRL_INIT);
+}
+
+static
+bool cointerra_queue_append(struct thr_info * const thr, struct work * const work)
+{
+	struct cgpu_info * const dev = thr->cgpu->device;
+	struct thr_info * const master_thr = dev->thr[0];
+	uint8_t buf[COINTERRA_MSGBODY_SIZE];
+	int e;
+	
+	memcpy(&buf[6], work->midstate, 0x20);
+	memcpy(&buf[38], &work->data[0x40], 0xc);
+	pk_u16le(buf, 50, 0);  // ntime roll limit
+	pk_u16le(buf, 52, 0x20);  // number of zero bits in results
+	e = cointerra_write_msg(usbh, cointerra_drv.dname, CMTO_REQUEST, buf, COINTERRA_USB_TIMEOUT);
+	if (e)
+		return false;
+	
+	DL_APPEND(thr->work, work);
+}
+
+static
+bool cointerra_poll_msg(struct thr_info * const master_thr)
+{
+	struct cgpu_info * const dev = master_thr->cgpu;
+	struct cointerra_dev_state * const devstate = dev->device_data;
+	int e;
+	uint16_t msgtype;
+	uint8_t buf[COINTERRA_MSG_SIZE];
+	
+	e = cointerra_read_msg(&msgtype, buf, devstate->usbh, dev->dev_repr, COINTERRA_USB_POLL_TIMEOUT);
+	if (e)
+		return false;
+	
+	switch (msgtype)
+	{
+		case CMTI_WORKREQ:
+		case CMTI_MATCH:
+		case CMTI_WORKDONE:
+		case CMTI_STATUS:
+		case CMTI_SETTINGS:
+		case CMTI_INFO:
+		case CMTI_LOGMSG:
+		case CMTI_RESETDONE:
+		case CMTI_ERRINFO:
+	}
+}
+
+static
+void cointerra_poll(struct thr_info * const master_thr)
+{
+	struct cgpu_info * const dev = master_thr->cgpu;
+	struct timeval tv_timeout;
+	timer_set_delay_from_now(&tv_timeout, 10000);
+	while (true)
+	{
+		if (!cointerra_poll_msg(master_thr))
+		{
+			applog(LOG_DEBUG, "%s poll: No more messages", dev->dev_repr);
+			break;
+		}
+		if (timer_passed(&tv_timeout, NULL))
+		{
+			applog(LOG_DEBUG, "%s poll: 10ms timeout met", dev->dev_repr);
+			break;
+		}
+	}
+	
+	timer_set_delay_from_now(&master_thr->tv_poll, 100000);
 }
 
 struct device_drv cointerra_drv = {
@@ -143,4 +283,9 @@ struct device_drv cointerra_drv = {
 	
 	.lowl_match = cointerra_lowl_match,
 	.lowl_probe = cointerra_lowl_probe,
+	
+	.minerloop = minerloop_queue,
+	.thread_init = cointerra_init,
+	.queue_append = cointerra_queue_append,
+	.poll = cointerra_poll,
 };
